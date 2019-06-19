@@ -1,0 +1,665 @@
+---
+title: "Dahlin 2018 Bone Marrow Hematopoetic Progenitors"
+author: Will Townes and Stephanie Hicks
+output: 
+    html_document:
+        theme: cosmo 
+        toc: true
+        toc_float: true
+        highlight: tango
+        number_sections: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, 
+                      message = FALSE)
+```
+
+```{r}
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+library(slingshot)
+library(RColorBrewer)
+
+# bp <-"./real/dahlin_2018"
+bp <- "/users/shicks1/data/GEO/GSE107727"
+fp <-file.path
+```
+
+Also these packages need to be installed, but I don't load them entirely to avoid 
+function conflicts. 
+
+```{r, eval=FALSE}
+library(readr)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(HDF5Array)
+```
+
+
+
+# Overview
+
+This is the code to produce a *SingleCellExperiment* object of the 
+scRNA-Seq experiment by Dahlin et al. (2018) and GEO accession 
+[GSE107727](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE107727). 
+
+### Citation 
+
+Dahlin JS, Hamey FK, Pijuan-Sala B, Shepherd M et al. A single-cell 
+hematopoietic landscape resolves 8 lineage trajectories and defects in 
+Kit mutant mice. Blood 2018 May 24;131(21):e1-e11. PMID: 29588278
+
+### Description extracted from GEO
+
+Haematopoietic stem and progenitor cells (HSPCs) maintain the adult blood 
+system and their dysregulation causes a multitude of diseases. However, 
+the differentiation journeys towards specific haematopoietic lineages 
+remain ill defined, and system-wide disease interpretation remains 
+challenging. Here, we have profiled 44,802 mouse bone marrow HSPCs 
+using single cell RNA-Sequencing to provide a comprehensive transcriptional 
+landscape with entry points to eight different blood lineages. 
+We identified a common basophil/mast cell bone marrow progenitor, and 
+characterised its molecular profile at the single cell level. Transcriptome 
+sequencing of 13,815 HSPCs from the c-kit mutant W41 mouse model revealed 
+the lack of a distinct mast cell lineage entry point, together with global 
+shifts in cell type abundance. Proliferative defects were accompanied by 
+reduced Myc expression. Compensatory processes included upreglation of the 
+integrated stress response pathway and downregulation of pro-apoptotic 
+gene expression in erythroid progenitors, thus providing a template of how 
+single cell transcriptomics can reveal qualitative, quantitative and 
+molecular aspects of mutant phenotypes.
+
+# Data 
+
+### Download Phenodata
+
+```{r, eval=FALSE}
+gse <- GEOquery::getGEO("GSE107727")
+gse <- gse[[1]]
+pdata <- pData(gse)
+dim(pdata)
+```
+
+Each row is a sample (cell), each column is some phenotype attribute. 
+
+Next save the phenotypic data file
+```{r, eval=FALSE}
+if(!file.exists(fp(bp,"extdata"))){
+  dir.create(fp(bp,"extdata"))
+}
+write.table(pdata, file=fp(bp,"extdata/pData.txt"))
+```
+
+### Download count matrices 
+
+First, we create a `/data` folder to store the `.txt.gz` files
+that contain the count matrices. 
+```{r}
+pdata <- read.table(fp(bp,"extdata/pData.txt"))
+if(!file.exists(fp(bp,"data"))){
+  dir.create(fp(bp,"data"))
+}
+```
+
+Here, we use `purrr::map()` to loop over the eight file names. We also
+rename the columns to include the name of the sample and barcode id. 
+```{r}
+data_sets <- 
+  purrr::map(as.character(pdata$supplementary_file_1), 
+    function(x){ 
+        fname <- unlist(strsplit(x, "/")) 
+        fname <- fname[length(fname)] 
+        if(!file.exists(fp(bp,"data",fname))){
+          download.file(x, destfile = fp(bp,"data",fname))
+        } 
+        colnames_data <- readr::read_delim(fp(bp,"data", fname), 
+                                           delim = "\t", col_names = FALSE, n_max = 1)
+        dat <- readr::read_delim(fp(bp,"data", fname), 
+                                 delim = "\t", col_names = FALSE, skip = 1)
+        sample_id <- unlist(lapply(stringr::str_split(fname, pattern = "_"), function(x){ x[[2]]}))
+        colnames(dat) <- c("gene_name", paste(sample_id, colnames_data, sep="_"))
+        dat
+    }
+  )
+length(data_sets)
+```
+
+The data are stored in a list of of length 8. Each element 
+in the list contains a count matrix. Now let's put it all 
+together. 
+
+```{r}
+counts_clean <- 
+  purrr::reduce(data_sets, dplyr::left_join, by = "gene_name")
+rm(data_sets) # to clean out memory
+dim(counts_clean)
+```
+
+Alright, so we see there are `r dim(counts_clean)[2]` cells
+and `r dim(counts_clean)[1]` genes in total. 
+
+This object is also pretty big 
+```{r}
+object.size(counts_clean) / 1e9
+```
+
+So, let's convert the tibble `counts_clean` object to a `hdf5` object
+
+```{r}
+library(rhdf5)
+
+h5File <- fp(bp,"data","dahlin_2018_counts.h5")
+# counts_clean_hdf5 <- HDF5Array::writeHDF5Array(as.matrix(counts_clean[,-1]), 
+#                                     filepath = h5File, name="counts")
+counts_clean_hdf5 <- HDF5Array::HDF5Array(h5File, "counts")
+object.size(counts_clean_hdf5)
+```
+
+This is a much smaller size.
+
+### Create a SingleCellExperiment object
+
+Now that we have our count matrix, let's create a 
+`SingleCellExperiment` object. 
+
+```{r, eval=FALSE}
+row_dat <- DataFrame(gene_name = counts_clean$gene_name)
+
+sample_id <- unlist(lapply(stringr::str_split(colnames(counts_clean)[-1], pattern = "_"), function(x){ x[[1]]}))
+barcode_id <- unlist(lapply(stringr::str_split(colnames(counts_clean)[-1], pattern = "_"), function(x){ x[[2]]}))
+col_dat <- DataFrame(cell_name = colnames(counts_clean)[-1],
+                     sample_id = sample_id,
+                     barcode_id = barcode_id)
+
+sce <- SingleCellExperiment(assays=list(counts=counts_clean_hdf5),
+                            rowData=row_dat, colData=col_dat)
+metadata(sce) <- pdata
+```
+
+Now we will select only one sample
+
+```{r}
+names(table(colData(sce)$sample_id))
+# [1] "SIGAB1" "SIGAC1" "SIGAD1" "SIGAF1" "SIGAG1" "SIGAG8" "SIGAH1" "SIGAH8"
+
+sce <- sce[, colData(sce)$sample_id == names(table(colData(sce)$sample_id))[1] ]
+
+tmp <- as.matrix(counts(sce))
+counts(sce) <- tmp
+```
+
+# Exploratory data analysis 
+
+### Quality control 
+
+```{r scater-qc-basic, message=FALSE, cache=TRUE, eval=FALSE}
+sce <- getBMFeatureAnnos(sce, 
+            ids = rowData(sce)$gene_name,
+            filters = "ensembl_gene_id",
+            attributes = c("ensembl_gene_id",
+                           "mgi_symbol", "chromosome_name",
+                           "start_position", "end_position"),
+            biomart = "ENSEMBL_MART_ENSEMBL",
+            dataset = "mmusculus_gene_ensembl",
+            host = "www.ensembl.org")
+
+# separate information about mitochondrial genes
+rowData(sce)[grep("^mt", rowData(sce)$mgi_symbol),]
+isSpike(sce, "MT") <- grepl("^mt-", rowData(sce)$mgi_symbol)
+
+# calculate QC metrics
+sce <- calculateQCMetrics(sce)
+
+# save SCE object
+# saveRDS(sce, fp(bp, "data", "dahlin_2018_sce.rds"))
+```
+
+Load object
+```{r}
+sce <- readRDS(fp(bp, "data", "dahlin_2018_sce.rds"))
+object.size(sce) / 1e6
+```
+
+
+### EDA and QC on cells 
+
+Histogram of library sizes and number 
+of expressed genes.
+```{r}
+par(mfrow=c(1,2))
+hist(sce$total_counts/1e4, xlab="Library sizes (thousands)", main="",
+     breaks=20, col="grey80", ylab="Number of cells")
+hist(sce$total_features_by_counts, xlab="Number of expressed genes", main="",
+     breaks=20, col="grey80", ylab="Number of cells")
+```
+
+We should also look at the percent of reads mapping to MT genes, 
+which could be evidence that we should exclude these cells
+
+```{r}
+par(mfrow=c(1,1))
+plot(sce$total_features_by_counts, sce$pct_counts_MT)
+```
+
+There are definitely cells that have a higher pct MT. 
+
+
+#### Remove low-quality cells 
+
+We remove cells with log-library sizes that are more than 
+3 median absolute deviations (MADs) below the median 
+log-library size. (A log-transformation improves resolution 
+at small values, especially when the MAD of the raw values 
+is comparable to or greater than the median). Next, we 
+remove cells where the log-transformed number of expressed 
+genes is 3 MADs below the median. Then, we remove cells 
+with percent MT 3 MADs above the median. 
+
+```{r}
+libsize.drop <- isOutlier(sce$total_counts, nmads=3, type="lower", log=TRUE)
+feature.drop <- isOutlier(sce$total_features_by_counts, nmads=3, type="lower", log=TRUE)
+MT.drop <- isOutlier(sce$pct_counts_MT, nmads=3, type="higher", log=TRUE)
+
+data.frame(ByLibSize=sum(libsize.drop), ByFeature=sum(feature.drop), 
+    BySpike=sum(MT.drop), Remaining=ncol(sce))
+
+sce <- sce[,!(libsize.drop | feature.drop | MT.drop)]
+
+# sanity check
+par(mfrow=c(1,1))
+plot(sce$total_features_by_counts, sce$pct_counts_MT)
+```
+
+### EDA and QC on the genes
+
+Next we want to filter out low abundance 
+genes. First let's look at which genes are the
+most highly expressed
+
+```{r}
+fontsize <- theme(axis.text=element_text(size=12), 
+                  axis.title=element_text(size=16))
+
+plotHighestExprs(sce, n=25, 
+                 feature_names_to_plot = "mgi_symbol") + 
+  fontsize
+```
+
+We will consider the average count for each gene, 
+computed across all cells in the dataset. We calculate
+this using the `calcAverage()` function, which also 
+performs some adjustment for library size differences 
+between cells. 
+
+```{r}
+# Remove genes not greater than a certain threshold in avg expression
+par(mfrow=c(1,1))
+ave.counts <- calcAverage(sce, use_size_factors=FALSE)
+hist(log10(ave.counts), breaks=100, main="", col="grey80", 
+    xlab=expression(Log[10]~"average count"))
+```
+
+We see a lot of genes are really lowly expressed! 
+
+We can also look at genes expressed in at least $N$ cells. 
+This is closely related to the average count for most genes, 
+as expression in many cells will result in a higher average. 
+Genes expressed in very few cells are often uninteresting as 
+they are driven by amplification artifacts (though they may 
+also also arise from rare populations). We could then remove 
+genes that are expressed in fewer than $N$ cells.
+
+```{r}
+num.cells <- nexprs(sce, byrow=TRUE)
+smoothScatter(log10(ave.counts), num.cells, ylab="Number of cells", 
+    xlab=expression(Log[10]~"average count"))
+```
+
+#### Remove low-quality genes 
+
+This plot suggestions we should consider removing genes 
+with a min average gene expression of -3 or -4 
+(on `log10` scale). We also remove genes without 
+expression in at least 1 cell. Finally, I needed to 
+remove a cell that had zero reads in the MT genes
+which will cause trouble for normalization if not
+addressed here. 
+
+```{r}
+keep_feature <- (num.cells >= 1) & (log10(ave.counts) > -4)
+table(keep_feature)
+
+sce_norm <- sce[keep_feature, ]
+sce_norm
+```
+
+
+# Preprocessing 
+
+### Normalization
+
+We compute size factors for the endogenous genes 
+using the deconvolution method (Lun, Bach, and Marioni 2016).
+This is done with pre-clustering through `quickCluster()`
+to avoid pooling together very different cells.
+
+```{r, eval=FALSE}
+library(scran)
+
+set.seed(12345)
+clusters <- quickCluster(sce_norm, method="igraph", min.mean=0.01)
+table(clusters)
+
+sce_norm <- computeSumFactors(sce_norm, min.mean=0.01, clusters=clusters)
+summary(sizeFactors(sce_norm))
+```
+
+```{r, eval=FALSE}
+sce_norm <- computeSpikeFactors(sce_norm, type="MT", general.use=FALSE)
+```
+
+Finally, normalized log-expression values are computed for
+each endogenous gene or spike-in transcript using the
+appropriate size factors.
+
+```{r, eval=FALSE}
+sce_norm <- normalize(sce_norm)
+
+# save SCE object
+# saveRDS(sce_norm, fp(bp, "data", "dahlin_2018_sce_norm.rds"))
+```
+
+Load object
+```{r}
+sce_norm <- readRDS(fp(bp, "data", "dahlin_2018_sce_norm.rds"))
+object.size(sce_norm) / 1e6
+```
+
+
+### Feature selection 
+
+#### Highly variable genes 
+
+Here we apply feature selection using highly variable genes
+and we filter to keep only the top 1500 genes. 
+
+```{r}
+keep_cell_MT <- (colSums(counts(sce_norm[isSpike(sce_norm), ])) >1)
+sce_norm <- sce_norm[, keep_cell_MT]
+sce_norm
+```
+
+```{r}
+var.fit <- trendVar(sce_norm, parametric=FALSE)
+var.out <- decomposeVar(sce_norm, var.fit)
+var.out$mgi_symbol <- rowData(sce_norm)$mgi_symbol
+var.out$ensembl_gene_id <- rowData(sce_norm)$ensembl_gene_id
+plot(var.out$mean, var.out$total, pch=16, cex=0.6, xlab="Mean log-expression", 
+    ylab="Variance of log-expression")
+curve(var.fit$trend(x), col="dodgerblue", lwd=2, add=TRUE)
+cur.spike <- isSpike(sce_norm)
+points(var.out$mean[cur.spike], var.out$total[cur.spike], col="red", pch=16)
+```
+
+We define HVGs as those genes that have a biological component 
+that is significantly greater than zero. We use a false discovery 
+rate (FDR) of 5% after correcting for multiple testing with 
+the Benjamini-Hochberg method.
+
+```{r}
+hvg.out <- var.out[which(var.out$FDR <= 0.05),]
+nrow(hvg.out)
+```
+
+We rank the results to focus on genes with larger biological 
+components. This highlights an interesting aspect of the underlying 
+hypothesis test, which is based on the ratio of the total variance 
+to the expected technical variance. Ranking based on p-value tends 
+to prioritize HVGs that are more likely to be true positives but, 
+at the same time, less likely to be interesting. This is because 
+the ratio can be very large for HVGs that have very low total 
+variance and do not contribute much to the cell-cell heterogeneity.
+```{r}
+hvg.out <- hvg.out[order(hvg.out$bio, decreasing=TRUE),] 
+head(hvg.out)
+```
+
+```{r}
+# remove MT genes for downstream analyses
+sce_hvg <- sce_norm[match(hvg.out$ensembl_gene_id, rowData(sce_norm)$ensembl_gene_id), ]
+sce_hvg <- sce_hvg[!rowData(sce_hvg)$is_feature_control, ] 
+sce_hvg <- sce_hvg[!is.na( rowData(sce_hvg)$mgi_symbol),]
+rownames(sce_hvg) <- rowData(sce_hvg)$mgi_symbol
+```
+
+#### Highly deviant genes 
+
+Here we apply feature selection using highly deviant genes
+using the binomial model and we filter to keep only 
+the top 1500 genes. 
+
+```{r}
+source("https://github.com/willtownes/scrna2019/raw/master/util/functions.R")
+filterDev<-function(sce,nkeep=nrow(sce),dev=c("binomial","multinomial","poisson","geometric")){
+  dev<-match.arg(dev)
+  gm<-compute_gene_info(counts(sce),gmeta=rowData(sce),mod=dev)
+  o<-order(gm$deviance,decreasing=TRUE,na.last=FALSE)
+  #NA deviance => badly fitting null model=> highly variable gene
+  res<-sce[o[1:nkeep],]
+  res[,colSums(counts(res))>0]
+}
+
+sce_devbin <- sce_norm[!rowData(sce_norm)$is_feature_control, ] 
+sce_devbin <- filterDev(sce = sce_devbin, dev = "binomial", nkeep = 1500)
+sce_devbin <- sce_devbin[!is.na( rowData(sce_devbin)$mgi_symbol),]
+rownames(sce_devbin) <- rowData(sce_devbin)$mgi_symbol
+```
+
+
+
+# Dimension reduction
+
+Next we will apply a few dimension reduction methods: 
+
+* PCA with highly variable genes
+* UMAP with highly variable genes
+* GLM-PCA with highly deviant genes 
+
+### PCA (using HVGs)
+
+Using `method="irlba"` for speed. 
+```{r}
+sce_hvg <- runPCA(sce_hvg, ntop=Inf, method="irlba", 
+                  ncomponents=25)
+plotPCA(sce_hvg, colour_by="log10_total_counts") + ggtitle("PCA")
+```
+
+### UMAP (using HVGs)
+
+Using `use_dimred = "PCA"` for speed.
+```{r}
+set.seed(12345)
+sce_hvg <- runUMAP(sce_hvg, ncomponents = 2, ntop=500, 
+                   use_dimred = "PCA", pca=5)
+plotUMAP(sce_hvg, colour_by="log10_total_counts") + ggtitle("umap")
+```
+
+### GLM-PCA (using HDevGs)
+
+```{r}
+source("https://raw.githubusercontent.com/willtownes/scrna2019/master/algs/glmpca.R")
+Y <- counts(sce_devbin)
+
+# Assuming there is no batch or covariates to worry about, then run
+res <- glmpca(Y,L=2,fam="poi",verbose=TRUE)
+
+# optionally, to visualize the trace plot of the penalized deviance objective function and ensure it is decreasing
+plot(res$dev,type="l",log="y")
+# done in around 50-400 iterations
+
+# to extract the factors (or reduced dimensions) for clustering or visualization (cells=rows)
+rd <- res$factors
+reducedDim(sce_devbin, "glmpca") <- as.matrix(rd)
+pdf("forWill.pdf")
+plot(rd[,1],rd[,2])
+dev.off()
+```
+
+### UMAP (using HDevG)
+
+Using `use_dimred = "PCA"` for speed.
+```{r}
+set.seed(12345)
+sce_devbin <- runUMAP(sce_devbin, ncomponents = 2, ntop=500, 
+                   use_dimred = "glmpca")
+plotUMAP(sce_devbin, colour_by="log10_total_counts") + ggtitle("umap")
+plotUMAP(sce_devbin, colour_by="Elane") + ggtitle("umap")
+
+```
+
+
+# Trajectory analysis 
+
+For this section, we will use the trajectory method `slingshot`. 
+The minimal input to `slingshot` is a matrix representing the 
+cells in a reduced-dimensional space and a vector of cluster labels.
+
+### Slingshot 
+
+First we use _k_-means 
+
+```{r}
+k.max <- 15
+rd <- as.matrix(reducedDim(sce_devbin, "UMAP"))
+wss <- sapply(1:k.max, 
+              function(k){kmeans(rd, nstart=50,iter.max = 15, centers = k)$tot.withinss})
+wss
+
+plot(1:k.max, wss,
+     type="b", pch = 19, frame = FALSE, 
+     xlab="Number of clusters K", main = "Elbow plot",
+     ylab="Total within-clusters sum of squares")
+```
+
+So let's go with 4? 
+```{r}
+set.seed(12345)
+k_out <- kmeans(rd, centers = 4)
+plot(rd, col = k_out$cluster)
+
+sce_devbin$cluster_labels <- k_out$cluster
+```
+
+```{r}
+sce_devbin <- slingshot(sce_devbin, clusterLabels = 'cluster_labels', 
+                        reducedDim = 'UMAP')
+summary(sce_devbin$slingPseudotime_1)
+
+colors <- colorRampPalette(brewer.pal(11,'Spectral')[-6])(100)
+plot(reducedDim(sce_devbin, "UMAP"), 
+     col = colors[cut(sce_devbin$slingPseudotime_1,breaks=100)], 
+     pch=16, asp = 1)
+lines(SlingshotDataSet(sce_devbin), lwd=2)
+```
+
+
+
+
+We can also see how the lineage structure was intially estimated
+by the cluster-based minimum spanning tree by using the type argument.
+
+```{r}
+plot(reducedDim(sce_devbin, "UMAP"), 
+     col = brewer.pal(8,'Set1')[sce_devbin$cluster_labels],
+     pch=16, asp = 1)
+lines(SlingshotDataSet(sce_devbin), lwd=2, type = 'lineages')
+```
+
+
+
+After running `slingshot`, here, we find genes that change 
+their expression over the course of development. We use the 
+1000 most variable genes.
+
+We will regress each gene on the pseudotime variable we
+have generated, using a general additive model (GAM). This
+allows us to detect non-linear patterns in gene expression.
+
+```{r}
+require(gam)
+t <- sce_devbin$slingPseudotime_1
+
+# for time, only look at the 100 most variable genes
+Y <- assays(sce_devbin[1:100,])$logcounts
+
+# fit a GAM with a loess term for pseudotime
+gam.pval <- apply(Y,1,function(z){
+  d <- data.frame(z=z, t=t)
+  tmp <- gam(z ~ lo(t), data=d)
+  p <- summary(tmp)[4][[1]][1,5]
+  p
+})
+```
+
+We can then pick out the top genes based on p-value and 
+visualize their expression over developmental time with a heatmap.
+
+```{r}
+require(clusterExperiment)
+
+topgenes <- names(sort(gam.pval, decreasing = FALSE))[1:50]
+heatdata <- logcounts(sce_devbin)[rownames(logcounts(sce_devbin)) %in% topgenes, 
+                        order(t, na.last = NA)]
+heatclus <- sce_devbin$cluster_labels[order(t, na.last = NA)]
+ce <- ClusterExperiment(heatdata, heatclus, transformation = log1p)
+```
+
+```{r, eval=FALSE}
+# pdf(file.path(workingPath, "figures/2019-04-02-slingshot-heatmap.pdf"), width=12,height=4)
+  plotHeatmap(ce[,1:100], clusterSamplesData = "orderSamplesValue", 
+              visualizeData = 'transformed')
+# dev.off()
+```
+
+```{r, eval=FALSE}
+p1 <- plotUMAP(sce_devbin, colour_by="Dntt") + ggtitle("umap")
+p2 <- plotUMAP(sce_devbin, colour_by="Pf4") + ggtitle("umap")
+p3 <- plotUMAP(sce_devbin, colour_by="Irf8") + ggtitle("umap")
+p4 <- plotUMAP(sce_devbin, colour_by="Cpa3") + ggtitle("umap")
+p5 <- plotUMAP(sce_devbin, colour_by=topgenes[5]) + ggtitle("umap")
+p6 <- plotUMAP(sce_devbin, colour_by=topgenes[6]) + ggtitle("umap")
+p7 <- plotUMAP(sce_devbin, colour_by=topgenes[7]) + ggtitle("umap")
+p8 <- plotUMAP(sce_devbin, colour_by=topgenes[8]) + ggtitle("umap")
+p9 <- plotUMAP(sce_devbin, colour_by=topgenes[9]) + ggtitle("umap")
+p10 <- plotUMAP(sce_devbin, colour_by=topgenes[10]) + ggtitle("umap")
+p11 <- plotUMAP(sce_devbin, colour_by=topgenes[11]) + ggtitle("umap")
+p12 <- plotUMAP(sce_devbin, colour_by=topgenes[12]) + ggtitle("umap")
+p13 <- plotUMAP(sce_devbin, colour_by=topgenes[13]) + ggtitle("umap")
+p14 <- plotUMAP(sce_devbin, colour_by=topgenes[14]) + ggtitle("umap")
+p15 <- plotUMAP(sce_devbin, colour_by=topgenes[15]) + ggtitle("umap")
+p16 <- plotUMAP(sce_devbin, colour_by=topgenes[16]) + ggtitle("umap")
+p17 <- plotUMAP(sce_devbin, colour_by=topgenes[17]) + ggtitle("umap")
+p18 <- plotUMAP(sce_devbin, colour_by=topgenes[18]) + ggtitle("umap")
+p19 <- plotUMAP(sce_devbin, colour_by=topgenes[19]) + ggtitle("umap")
+p20 <- plotUMAP(sce_devbin, colour_by=topgenes[20]) + ggtitle("umap")
+
+fig <- cowplot::plot_grid(p1, p2,  p3, p4, p5, p6, p7, p8, p9, p10, 
+                          p11, p12, p13, p14, p15, p16, p17, p18, p19, p20,
+                          ncol = 5)
+
+pdf(file.path(workingPath, "figures/2019-04-02-slingshot-hvg.pdf"), width=25,height=20)
+print(fig)
+dev.off()
+```
+
+
+
+
+
+
+
+
+
