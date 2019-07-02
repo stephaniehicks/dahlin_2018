@@ -24,7 +24,7 @@ library(RColorBrewer)
 
 # bp <-"./real/dahlin_2018"
 bp <- "/users/shicks1/data/GEO/GSE107727"
-fp <-file.path
+fp <- file.path
 ```
 
 Also these packages need to be installed, but I don't load them entirely to avoid 
@@ -241,6 +241,7 @@ which could be evidence that we should exclude these cells
 
 ```{r}
 par(mfrow=c(1,1))
+plot(sce$total_counts, sce$pct_counts_MT)
 plot(sce$total_features_by_counts, sce$pct_counts_MT)
 ```
 
@@ -259,7 +260,7 @@ genes is 3 MADs below the median. Then, we remove cells
 with percent MT 3 MADs above the median. 
 
 ```{r}
-libsize.drop <- isOutlier(sce$total_counts, nmads=3, type="lower", log=TRUE)
+libsize.drop <- isOutlier(sce$total_counts, nmads=3, type="higher", log=TRUE)
 feature.drop <- isOutlier(sce$total_features_by_counts, nmads=3, type="lower", log=TRUE)
 MT.drop <- isOutlier(sce$pct_counts_MT, nmads=3, type="higher", log=TRUE)
 
@@ -269,8 +270,10 @@ data.frame(ByLibSize=sum(libsize.drop), ByFeature=sum(feature.drop),
 sce <- sce[,!(libsize.drop | feature.drop | MT.drop)]
 
 # sanity check
-par(mfrow=c(1,1))
+par(mfrow=c(1,2))
+plot(sce$total_counts, sce$pct_counts_MT)
 plot(sce$total_features_by_counts, sce$pct_counts_MT)
+
 ```
 
 ### EDA and QC on the genes
@@ -329,11 +332,11 @@ which will cause trouble for normalization if not
 addressed here. 
 
 ```{r}
-keep_feature <- (num.cells >= 1) & (log10(ave.counts) > -4)
+num_reads <- 1                  # minimum 1 read
+num_cells <- 0.025 * ncol(sce)  # in at least 2.5% of all cells
+keep_feature <- rowSums(counts(sce) >= num_reads) >= num_cells
 table(keep_feature)
-
-sce_norm <- sce[keep_feature, ]
-sce_norm
+sce <- sce[keep_feature, ]
 ```
 
 
@@ -350,15 +353,16 @@ to avoid pooling together very different cells.
 library(scran)
 
 set.seed(12345)
-clusters <- quickCluster(sce_norm, method="igraph", min.mean=0.01)
+clusters <- quickCluster(sce, method="igraph", min.mean=0.01)
 table(clusters)
 
-sce_norm <- computeSumFactors(sce_norm, min.mean=0.01, clusters=clusters)
-summary(sizeFactors(sce_norm))
+sce <- computeSumFactors(sce, min.mean=0.01, clusters=clusters)
+plot(sce$total_counts, sizeFactors(sce))
+summary(sizeFactors(sce))
 ```
 
 ```{r, eval=FALSE}
-sce_norm <- computeSpikeFactors(sce_norm, type="MT", general.use=FALSE)
+sce <- computeSpikeFactors(sce, type="MT", general.use=FALSE)
 ```
 
 Finally, normalized log-expression values are computed for
@@ -366,7 +370,7 @@ each endogenous gene or spike-in transcript using the
 appropriate size factors.
 
 ```{r, eval=FALSE}
-sce_norm <- normalize(sce_norm)
+sce_norm <- normalize(sce)
 
 # save SCE object
 # saveRDS(sce_norm, fp(bp, "data", "dahlin_2018_sce_norm.rds"))
@@ -385,12 +389,6 @@ object.size(sce_norm) / 1e6
 
 Here we apply feature selection using highly variable genes
 and we filter to keep only the top 1500 genes. 
-
-```{r}
-keep_cell_MT <- (colSums(counts(sce_norm[isSpike(sce_norm), ])) >1)
-sce_norm <- sce_norm[, keep_cell_MT]
-sce_norm
-```
 
 ```{r}
 var.fit <- trendVar(sce_norm, parametric=FALSE)
@@ -453,8 +451,7 @@ filterDev<-function(sce,nkeep=nrow(sce),dev=c("binomial","multinomial","poisson"
 }
 
 sce_devbin <- sce_norm[!rowData(sce_norm)$is_feature_control, ] 
-sce_devbin <- filterDev(sce = sce_devbin, dev = "binomial", nkeep = 1500)
-sce_devbin <- sce_devbin[!is.na( rowData(sce_devbin)$mgi_symbol),]
+sce_devbin <- filterDev(sce = sce_devbin, dev = "binomial", nkeep = 2000)
 rownames(sce_devbin) <- rowData(sce_devbin)$mgi_symbol
 ```
 
@@ -464,9 +461,53 @@ rownames(sce_devbin) <- rowData(sce_devbin)$mgi_symbol
 
 Next we will apply a few dimension reduction methods: 
 
+* GLM-PCA with highly deviant genes 
 * PCA with highly variable genes
 * UMAP with highly variable genes
-* GLM-PCA with highly deviant genes 
+
+### GLM-PCA (using HDevGs)
+
+```{r}
+source("https://raw.githubusercontent.com/willtownes/scrna2019/master/algs/glmpca.R")
+Y <- counts(sce_devbin)
+
+# Assuming there is no batch or covariates to worry about, then run
+res <- glmpca(Y,L=25,fam="nb",verbose=TRUE, penalty = 20)
+
+# optionally, to visualize the trace plot of the penalized deviance objective function and ensure it is decreasing
+plot(tail(res$dev, 30),type="l",log="y")
+# done in around 50-400 iterations
+
+# to extract the factors (or reduced dimensions) for clustering or visualization (cells=rows)
+rd <- res$factors
+reducedDim(sce_devbin, "glmpca") <- as.matrix(rd)
+pdf("forWill.pdf")
+plot(rd[,1],rd[,2])
+dev.off()
+
+s_rb <- scale_fill_gradient2(low='red', high ='blue')
+plotReducedDim(sce_devbin,  use_dimred = "glmpca", colour_by="Ltb") + s_rb # HSC
+plotReducedDim(sce_devbin,  use_dimred = "glmpca", colour_by="Elane") + s_rb # neutrophils
+plotReducedDim(sce_devbin,  use_dimred = "glmpca", colour_by="Dntt") + s_rb  # lymphoid
+plotReducedDim(sce_devbin,  use_dimred = "glmpca", colour_by="Irf8") + s_rb # monocytes
+plotReducedDim(sce_devbin,  use_dimred = "glmpca", colour_by="Pf4") + s_rb # megakaryocytes
+```
+
+### UMAP (using HDevG)
+
+Using `use_dimred = "PCA"` for speed.
+```{r}
+set.seed(12345)
+sce_devbin <- runUMAP(sce_devbin, ncomponents = 2, ntop=500, 
+                   use_dimred = "glmpca")
+plotUMAP(sce_devbin, colour_by="log10_total_counts") + ggtitle("umap") #  + s_rb
+plotUMAP(sce_devbin, colour_by="Ltb") + ggtitle("umap")  + s_rb # hsc
+plotUMAP(sce_devbin, colour_by="Elane") + ggtitle("umap")  + s_rb # neutrophils
+plotUMAP(sce_devbin, colour_by="Dntt") + ggtitle("umap") + s_rb # lymphoid
+plotUMAP(sce_devbin, colour_by="Irf8") + ggtitle("umap") + s_rb # monocytes
+plotUMAP(sce_devbin, colour_by="Pf4") + ggtitle("umap") + s_rb # megakaryocytes
+
+```
 
 ### PCA (using HVGs)
 
@@ -477,6 +518,7 @@ sce_hvg <- runPCA(sce_hvg, ntop=Inf, method="irlba",
 plotPCA(sce_hvg, colour_by="log10_total_counts") + ggtitle("PCA")
 ```
 
+
 ### UMAP (using HVGs)
 
 Using `use_dimred = "PCA"` for speed.
@@ -485,40 +527,9 @@ set.seed(12345)
 sce_hvg <- runUMAP(sce_hvg, ncomponents = 2, ntop=500, 
                    use_dimred = "PCA", pca=5)
 plotUMAP(sce_hvg, colour_by="log10_total_counts") + ggtitle("umap")
+plotUMAP(sce_hvg, colour_by="Mpo") + ggtitle("umap")
 ```
 
-### GLM-PCA (using HDevGs)
-
-```{r}
-source("https://raw.githubusercontent.com/willtownes/scrna2019/master/algs/glmpca.R")
-Y <- counts(sce_devbin)
-
-# Assuming there is no batch or covariates to worry about, then run
-res <- glmpca(Y,L=2,fam="poi",verbose=TRUE)
-
-# optionally, to visualize the trace plot of the penalized deviance objective function and ensure it is decreasing
-plot(res$dev,type="l",log="y")
-# done in around 50-400 iterations
-
-# to extract the factors (or reduced dimensions) for clustering or visualization (cells=rows)
-rd <- res$factors
-reducedDim(sce_devbin, "glmpca") <- as.matrix(rd)
-pdf("forWill.pdf")
-plot(rd[,1],rd[,2])
-dev.off()
-```
-
-### UMAP (using HDevG)
-
-Using `use_dimred = "PCA"` for speed.
-```{r}
-set.seed(12345)
-sce_devbin <- runUMAP(sce_devbin, ncomponents = 2, ntop=500, 
-                   use_dimred = "glmpca")
-plotUMAP(sce_devbin, colour_by="log10_total_counts") + ggtitle("umap")
-plotUMAP(sce_devbin, colour_by="Elane") + ggtitle("umap")
-
-```
 
 
 # Trajectory analysis 
@@ -533,7 +544,7 @@ First we use _k_-means
 
 ```{r}
 k.max <- 15
-rd <- as.matrix(reducedDim(sce_devbin, "UMAP"))
+rd <- as.matrix(reducedDim(sce_devbin, "glmpca"))
 wss <- sapply(1:k.max, 
               function(k){kmeans(rd, nstart=50,iter.max = 15, centers = k)$tot.withinss})
 wss
@@ -554,97 +565,62 @@ sce_devbin$cluster_labels <- k_out$cluster
 ```
 
 ```{r}
+lin1 <- getLineages(rd, clusterLabels = sce_devbin$cluster_labels)# , 
+                    # start.clus = 4, end.clus = 1)
+plot(rd, col = brewer.pal(9,"Set1")[sce_devbin$cluster_labels], 
+     asp = 1, pch = 16)
+lines(lin1, lwd = 3, col = 'black')
+
 sce_devbin <- slingshot(sce_devbin, clusterLabels = 'cluster_labels', 
-                        reducedDim = 'UMAP')
+                        reducedDim = 'glmpca')
 summary(sce_devbin$slingPseudotime_1)
 
 colors <- colorRampPalette(brewer.pal(11,'Spectral')[-6])(100)
-plot(reducedDim(sce_devbin, "UMAP"), 
+plot(reducedDim(sce_devbin, "glmpca"), 
      col = colors[cut(sce_devbin$slingPseudotime_1,breaks=100)], 
      pch=16, asp = 1)
 lines(SlingshotDataSet(sce_devbin), lwd=2)
 ```
 
 
-
-
 We can also see how the lineage structure was intially estimated
 by the cluster-based minimum spanning tree by using the type argument.
 
 ```{r}
-plot(reducedDim(sce_devbin, "UMAP"), 
+plot(reducedDim(sce_devbin, "glmpca"), 
      col = brewer.pal(8,'Set1')[sce_devbin$cluster_labels],
      pch=16, asp = 1)
 lines(SlingshotDataSet(sce_devbin), lwd=2, type = 'lineages')
 ```
 
-
-
-After running `slingshot`, here, we find genes that change 
-their expression over the course of development. We use the 
-1000 most variable genes.
-
-We will regress each gene on the pseudotime variable we
-have generated, using a general additive model (GAM). This
-allows us to detect non-linear patterns in gene expression.
-
 ```{r}
-require(gam)
-t <- sce_devbin$slingPseudotime_1
+rownames(sce_devbin) <- rowData(sce_devbin)$mgi_symbol
 
-# for time, only look at the 100 most variable genes
-Y <- assays(sce_devbin[1:100,])$logcounts
+plot(reducedDim(sce_devbin, "glmpca"), 
+     # col = colors[cut(sce_devbin$slingPseudotime_1,breaks=50)], 
+     col = colors[cut(rowData(sce_devbin) $slingPseudotime_1,breaks=50)], 
+     pch=16, asp = 1)
+lines(SlingshotDataSet(sce_devbin), lwd=2)
 
-# fit a GAM with a loess term for pseudotime
-gam.pval <- apply(Y,1,function(z){
-  d <- data.frame(z=z, t=t)
-  tmp <- gam(z ~ lo(t), data=d)
-  p <- summary(tmp)[4][[1]][1,5]
-  p
-})
+plotUMAP(sce_devbin, colour_by="Procr") + ggtitle("umap") + 
+  scale_fill_gradient2(low='red', high ='blue') # hsc
+plotUMAP(sce_devbin, colour_by="Dntt") + ggtitle("umap") # lymphoid
+
+plotUMAP(sce_devbin, colour_by="Irf8") + ggtitle("umap") # monocytes
+plotUMAP(sce_devbin, colour_by="Elane") + ggtitle("umap") # neutrophils
+plotUMAP(sce_devbin, colour_by="Pf4") + ggtitle("umap") # megakaryocytes
+plotUMAP(sce_devbin, colour_by="Klf1") + ggtitle("umap") # erythroid lineage
+
 ```
 
-We can then pick out the top genes based on p-value and 
-visualize their expression over developmental time with a heatmap.
-
-```{r}
-require(clusterExperiment)
-
-topgenes <- names(sort(gam.pval, decreasing = FALSE))[1:50]
-heatdata <- logcounts(sce_devbin)[rownames(logcounts(sce_devbin)) %in% topgenes, 
-                        order(t, na.last = NA)]
-heatclus <- sce_devbin$cluster_labels[order(t, na.last = NA)]
-ce <- ClusterExperiment(heatdata, heatclus, transformation = log1p)
-```
 
 ```{r, eval=FALSE}
-# pdf(file.path(workingPath, "figures/2019-04-02-slingshot-heatmap.pdf"), width=12,height=4)
-  plotHeatmap(ce[,1:100], clusterSamplesData = "orderSamplesValue", 
-              visualizeData = 'transformed')
-# dev.off()
-```
-
-```{r, eval=FALSE}
+rownames(sce_devbin) <- rowData(sce_devbin)$mgi_symbol
+plotReducedDim(sce_devbin, use_dimred = "glmpca", colour_by="Dntt")
 p1 <- plotUMAP(sce_devbin, colour_by="Dntt") + ggtitle("umap")
 p2 <- plotUMAP(sce_devbin, colour_by="Pf4") + ggtitle("umap")
 p3 <- plotUMAP(sce_devbin, colour_by="Irf8") + ggtitle("umap")
 p4 <- plotUMAP(sce_devbin, colour_by="Cpa3") + ggtitle("umap")
-p5 <- plotUMAP(sce_devbin, colour_by=topgenes[5]) + ggtitle("umap")
-p6 <- plotUMAP(sce_devbin, colour_by=topgenes[6]) + ggtitle("umap")
-p7 <- plotUMAP(sce_devbin, colour_by=topgenes[7]) + ggtitle("umap")
-p8 <- plotUMAP(sce_devbin, colour_by=topgenes[8]) + ggtitle("umap")
-p9 <- plotUMAP(sce_devbin, colour_by=topgenes[9]) + ggtitle("umap")
-p10 <- plotUMAP(sce_devbin, colour_by=topgenes[10]) + ggtitle("umap")
-p11 <- plotUMAP(sce_devbin, colour_by=topgenes[11]) + ggtitle("umap")
-p12 <- plotUMAP(sce_devbin, colour_by=topgenes[12]) + ggtitle("umap")
-p13 <- plotUMAP(sce_devbin, colour_by=topgenes[13]) + ggtitle("umap")
-p14 <- plotUMAP(sce_devbin, colour_by=topgenes[14]) + ggtitle("umap")
-p15 <- plotUMAP(sce_devbin, colour_by=topgenes[15]) + ggtitle("umap")
-p16 <- plotUMAP(sce_devbin, colour_by=topgenes[16]) + ggtitle("umap")
-p17 <- plotUMAP(sce_devbin, colour_by=topgenes[17]) + ggtitle("umap")
-p18 <- plotUMAP(sce_devbin, colour_by=topgenes[18]) + ggtitle("umap")
-p19 <- plotUMAP(sce_devbin, colour_by=topgenes[19]) + ggtitle("umap")
-p20 <- plotUMAP(sce_devbin, colour_by=topgenes[20]) + ggtitle("umap")
 
 fig <- cowplot::plot_grid(p1, p2,  p3, p4, p5, p6, p7, p8, p9, p10, 
                           p11, p12, p13, p14, p15, p16, p17, p18, p19, p20,
